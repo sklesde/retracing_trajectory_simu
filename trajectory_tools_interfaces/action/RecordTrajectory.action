@@ -1,0 +1,13 @@
+#Goal
+string session_name
+---
+#Result
+bool success
+string file_location
+string filename
+float32 total_time
+int32 total_points
+---
+#Feedback
+float32 current_time
+int32 current_points

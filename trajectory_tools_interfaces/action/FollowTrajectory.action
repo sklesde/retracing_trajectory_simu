@@ -1,0 +1,13 @@
+#Goal
+string csv_path
+string map_name
+
+---
+#Results
+bool success
+string message
+
+---
+#Feedback
+int32 curent_index
+float64 progress

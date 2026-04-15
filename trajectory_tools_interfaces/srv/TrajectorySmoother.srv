@@ -1,0 +1,4 @@
+geometry_msgs/PoseStamped[] input_data
+---
+geometry_msgs/PoseStamped[] output_data
+bool success    

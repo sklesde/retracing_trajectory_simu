@@ -1,0 +1,8 @@
+# Requête — ce qu'on envoie
+# (vide ici, comme Trigger, on veut juste déclencher l'arrêt)
+---
+# Réponse — ce qu'on reçoit
+bool success
+string filename
+string file_location
+int32 total_points
