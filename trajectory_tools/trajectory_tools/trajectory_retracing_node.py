@@ -1,5 +1,3 @@
-# ========================== IMPORTS ==========================
-
 import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
@@ -26,11 +24,9 @@ from math import pi as pi
 from scipy.spatial.transform import Rotation
 from tf2_ros import TransformException
 
-# ========================== CLASS ==========================
+
 
 class TrajectoryRetracing(Node):
-
-    # ====================== INIT ======================
 
     def __init__(self):
         super().__init__('trajectory_retracing')
@@ -56,6 +52,18 @@ class TrajectoryRetracing(Node):
         self.map_name = None
         self.robot_state = ""
         self.first_pos_to_reach = None
+        self.teleop_goal_handle = None
+
+        # -------- Robot states --------
+
+        self.STATE_IDLE = "IDLE"
+        self.STATE_GO_TO_NAV = "GO_TO_NAV"
+        self.STATE_NAV_INTERUPT = "NAV_INTERUPT"
+        self.STATE_RETRACING = "RETRACING"
+        self.STATE_FINISHED = "FINISHED"
+
+        self.robot_state = self.STATE_IDLE
+
 
         # -------- Services Clients --------
         self.client_getting_map = self.create_client(Trigger, '/get_map_name')
@@ -87,6 +95,7 @@ class TrajectoryRetracing(Node):
 
         # -------- Subscriptions / Timers --------
         self.create_subscription(Odometry, "odom", self.odom_callback, 10)
+        self.create_subscription(PoseStamped, '/goal_pose', self.goal_pose_callback, 10) 
         self.create_timer(0.1, self.following_path_callback)
         self.create_timer(1.0, self.republish_paths_timer)
 
@@ -102,7 +111,7 @@ class TrajectoryRetracing(Node):
         qw = msg.pose.pose.orientation.w
         self.current_position = (x,y,z,qx,qy,qz,qw)
 
-    # ====================== JSON / DATA ======================
+    # ====================== DATA ======================
 
     def reading_json(self):
         if self.fjson_name.exists() and self.fjson_name.stat().st_size !=0:
@@ -169,6 +178,7 @@ class TrajectoryRetracing(Node):
         data = self.reading_json()
         map_names = self.data_name_sorting(data)
         if len(map_names) == 0:
+            self.get_logger().warn('No map recorded, launch a record before retracing a path!')
             return
 
         if not self.map_name in map_names:
@@ -215,7 +225,13 @@ class TrajectoryRetracing(Node):
             self.get_logger().info(f"Current map: {map_name}")
         return map_name
     
-    def compute_initial_yaw_first_20cm(self):
+    def goal_pose_callback(self, msg):
+        if self.robot_state != 'retracing':
+            return
+
+        self.get_logger().info("Goal Nav2 detected")
+
+    def compute_initial_yaw_first(self):
         if self.poses is None or len(self.poses) < 2:
             return 0.0
 
@@ -254,6 +270,7 @@ class TrajectoryRetracing(Node):
     async def go_to_first_pose(self):
         self.get_logger().info("go_to_first_pose: Started")
         x, y = self.first_pos_to_reach
+        self.robot_state = self.STATE_GO_TO_NAV
 
         goal = NavigateToPose.Goal()
         goal.pose = PoseStamped()
@@ -261,7 +278,7 @@ class TrajectoryRetracing(Node):
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
 
-        yaw = self.compute_initial_yaw_first_20cm()
+        yaw = self.compute_initial_yaw_first()
         qz, qw = self.yaw_to_quaternion(yaw)
 
         goal.pose.pose.orientation.z = qz
@@ -281,14 +298,19 @@ class TrajectoryRetracing(Node):
 
         teleop_goal = AssistedTeleop.Goal()
         teleop_goal.time_allowance.sec = 0
-        self.assisted_teleop_client.send_goal_async(teleop_goal)
+        send_future = self.assisted_teleop_client.send_goal_async(teleop_goal)
+        self.teleop_goal_handle = await send_future
 
-        self.robot_state = 'retracing'
+        self.robot_state = self.STATE_RETRACING
 
     def finish_retracing(self):
+        self.robot_state = self.STATE_IDLE
+        self.stop_robot()
+        self.stop_assisted_teleop()
         request_play = Trigger.Request()
         future_play = self.client_play_recording.call_async(request_play)
         future_play.add_done_callback(self.on_play_done)
+        
 
     def on_play_done(self, future):
         self.get_logger().info('Ready to record again')
@@ -298,6 +320,19 @@ class TrajectoryRetracing(Node):
         self._execute_future.set_result(result)
 
     # ====================== ROBOT CONTROL ======================
+
+    def stop_assisted_teleop(self):
+        if self.teleop_goal_handle is None:
+            return
+
+        self.get_logger().info("Cancel AssistedTeleop")
+
+        future = self.teleop_goal_handle.cancel_goal_async()
+        future.add_done_callback(self._on_teleop_cancelled)
+
+    def _on_teleop_cancelled(self, future):
+        self.get_logger().info('Teleop cancelled')
+        self.teleop_goal_handle = None
 
     def stop_robot(self):
         stop_msg = TwistStamped()
@@ -349,7 +384,7 @@ class TrajectoryRetracing(Node):
                            (poses[-1].pose.position.y - robot_y) ** 2)
 
         if dist_to_end <= 0.10:
-            self.robot_state = 'finis'
+            self.robot_state = self.STATE_FINISHED
             self.stop_robot()
             self.finish_retracing()
             return
@@ -367,10 +402,10 @@ class TrajectoryRetracing(Node):
 
     def following_path_callback(self):
 
-        if self.robot_state != 'retracing':
-            if self.robot_state == 'finis':
+        if self.robot_state != self.STATE_RETRACING:
+            if self.robot_state == self.STATE_FINISHED:
                 self.stop_robot()
-                self.robot_state = ''
+                self.robot_state = self.STATE_IDLE
             return
 
         if self.poses is None:
@@ -422,7 +457,7 @@ class TrajectoryRetracing(Node):
         if future_pause.result() is not None and future_pause.result().success:
             self.get_logger().info('Pause of the record validated')
             self.current_index = 0
-            self.robot_state = ''
+            self.robot_state = self.STATE_IDLE
 
             if goal_handle.request.map_name != "":
                 map_name = goal_handle.request.map_name
@@ -454,9 +489,11 @@ class TrajectoryRetracing(Node):
             self.get_logger().info('go_to_first_pose: Succeded')
             result = await self._execute_future
             return result
-
+            
         else:
             self.get_logger().warn("The pause wasn't accepted or received")
+        
+        await self.stop_assisted_teleop()
 
 # ========================== MAIN ==========================
 
@@ -465,7 +502,7 @@ def main(args=None):
     node = TrajectoryRetracing()
 
     try:
-        rclpy.spin(node)
+        rclpy.spin(node)    
     except KeyboardInterrupt:
         node.get_logger().info("Keyboard interrupt received")
     finally:
