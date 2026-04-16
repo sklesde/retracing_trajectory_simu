@@ -1,3 +1,5 @@
+# ========================== IMPORTS ==========================
+
 import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock
@@ -19,7 +21,10 @@ from pathlib import Path
 from collections import deque
 import json
 import numpy as np
-from math import sqrt
+from math import sqrt, atan2
+from math import pi as pi
+from scipy.spatial.transform import Rotation
+from tf2_ros import TransformException
 
 # ========================== CLASS ==========================
 
@@ -85,6 +90,7 @@ class TrajectoryRetracing(Node):
         self.create_timer(0.1, self.following_path_callback)
         self.create_timer(1.0, self.republish_paths_timer)
 
+    # ====================== ODOM CALLBACK ======================
 
     def odom_callback(self, msg):
         x = msg.pose.pose.position.x
@@ -95,9 +101,10 @@ class TrajectoryRetracing(Node):
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         self.current_position = (x,y,z,qx,qy,qz,qw)
-    
-    def reading_json(self):
 
+    # ====================== JSON / DATA ======================
+
+    def reading_json(self):
         if self.fjson_name.exists() and self.fjson_name.stat().st_size !=0:
             with open(self.fjson_name, 'r', encoding='utf-8') as f:
                 try:
@@ -113,9 +120,7 @@ class TrajectoryRetracing(Node):
                     self.get_logger().warn("history.json not founded")
                     self.get_logger().warn(f"history.json path: {self.fjson_name}")
             return {}
-        
         return data
-
 
     def data_name_sorting(self, data):
         map_names = []
@@ -124,24 +129,21 @@ class TrajectoryRetracing(Node):
             if map_name not in map_names:
                 map_names.append(map_name)
         return map_names
-    
+
     def data_sorting(self, data, map_name):
-
         csv_files = []
-
         for traj_name, traj_data in data.items():
             map_name_on_file = traj_data.get('map_name')
             if map_name_on_file == map_name:
                 csv_files.append(traj_data.get("filename"))
-            
         return csv_files
-    
+
     def finding_total_path(self, csv_file):
         data_path = deque()
         for file in csv_file:
             path_file = self.log_dir / file
             with open(path_file, 'r') as f:
-                next(f) #to skip the first line
+                next(f)
                 for line in f:
                     values = line.strip().split(',')
                     timestamp = float(values[0])
@@ -153,65 +155,51 @@ class TrajectoryRetracing(Node):
                     qz = float(values[6])
                     qw = float(values[7])
                     data_path.append((timestamp, x, y, z, qx, qy, qz, qw))
-
         return data_path
-    
+
+    # ====================== TRAJECTORY BUILD ======================
+
     async def trajectory_retracing(self, map_name=None):
-        
         if map_name is not None:
             self.map_name = map_name
-            
         else:
             self.curent_map_name = await self.get_current_map_name()
             self.map_name = self.curent_map_name
-        
-        data = self.reading_json()
 
+        data = self.reading_json()
         map_names = self.data_name_sorting(data)
         if len(map_names) == 0:
-            return 
+            return
 
         if not self.map_name in map_names:
             self.get_logger().warn(f"The map you choose {self.curent_map_name} don't have any points, so the last map wil be replay {map_names[-1]}.\nYou can choose the map by using \"{{map_name: 'map_x'}}\"  with x the number of the map.")
             self.map_name = map_names[-1]
-        
         else:
             self.get_logger().info(f"The {self.map_name} will be used")
-            
+
         csv_files = self.data_sorting(data, self.map_name)
-        
         data_path = self.finding_total_path(csv_files)
-
-        #self.get_logger().info(f"Total points: {len(data_path)}") #debbug
-
         return data_path
-    
 
     def build_poses(self, data_path):
-
         poses = []
         for (timestamp, x, y, z, qx, qy, qz, qw) in data_path:
             pose = PoseStamped()
-
             pose.header.frame_id = "map"
-
             pose.header.stamp = Time()
-        
             pose.pose.position.x = x
             pose.pose.position.y = y
-            pose.pose.position.z = z            
-
+            pose.pose.position.z = z
             pose.pose.orientation.x = qx
             pose.pose.orientation.y = qy
             pose.pose.orientation.z = qz
             pose.pose.orientation.w = qw
-
             poses.append(pose)
-
         return list(reversed(poses))
+    
+        # ====================== MAP / NAVIGATION HELPERS ======================
 
     async def get_current_map_name(self):
-
         map_name = None
         while not self.client_getting_map.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Waiting for service...")
@@ -227,10 +215,44 @@ class TrajectoryRetracing(Node):
             self.get_logger().info(f"Current map: {map_name}")
         return map_name
     
+    def compute_initial_yaw_first_20cm(self):
+        if self.poses is None or len(self.poses) < 2:
+            return 0.0
+
+        target_distance = 0.2  # 20 cm
+        acc_dist = 0.0
+
+        dx_total = 0.0
+        dy_total = 0.0
+
+        for i in range(1, len(self.poses)):
+            p_prev = self.poses[i - 1].pose.position
+            p_cur = self.poses[i].pose.position
+
+            dx = p_cur.x - p_prev.x
+            dy = p_cur.y - p_prev.y
+
+            step_dist = sqrt(dx * dx + dy * dy)
+
+            if acc_dist + step_dist > target_distance:
+                ratio = (target_distance - acc_dist) / step_dist if step_dist > 0 else 0.0
+                dx_total += dx * ratio
+                dy_total += dy * ratio
+                break
+
+            dx_total += dx
+            dy_total += dy
+            acc_dist += step_dist
+
+        return atan2(dy_total, dx_total)
+    
+    def yaw_to_quaternion(self, yaw):
+        qz = np.sin(yaw / 2.0)
+        qw = np.cos(yaw / 2.0)
+        return qz, qw
 
     async def go_to_first_pose(self):
-
-        self.get_logger().info("go_to_first_pose started")
+        self.get_logger().info("go_to_first_pose: Started")
         x, y = self.first_pos_to_reach
 
         goal = NavigateToPose.Goal()
@@ -239,26 +261,34 @@ class TrajectoryRetracing(Node):
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
 
+        yaw = self.compute_initial_yaw_first_20cm()
+        qz, qw = self.yaw_to_quaternion(yaw)
+
+        goal.pose.pose.orientation.z = qz
+        goal.pose.pose.orientation.w = qw
+
+
         goal_handle = await self.navigate_to_pose.send_goal_async(goal)
-        self.get_logger().info(f"Goal accepted: {goal_handle.accepted}")
+        # self.get_logger().info(f"Goal accepted: {goal_handle.accepted}")
 
         if not goal_handle.accepted:
             self.get_logger().warn("Goal refused")
             return
-        self.get_logger().info("Waiting for result...")
-        result = await goal_handle.get_result_async()
-        self.get_logger().info("Result received!")
-        teleop_goal = AssistedTeleop.Goal()
-        teleop_goal.time_allowance.sec = 0 
-        self.assisted_teleop_client.send_goal_async(teleop_goal)
-        self.robot_state = 'retracing'
 
+        # self.get_logger().info("go_to_first_pose: Waiting for result...")
+        result = await goal_handle.get_result_async()
+        # self.get_logger().info("go_to_first_pose: Result received!")
+
+        teleop_goal = AssistedTeleop.Goal()
+        teleop_goal.time_allowance.sec = 0
+        self.assisted_teleop_client.send_goal_async(teleop_goal)
+
+        self.robot_state = 'retracing'
 
     def finish_retracing(self):
         request_play = Trigger.Request()
         future_play = self.client_play_recording.call_async(request_play)
         future_play.add_done_callback(self.on_play_done)
-
 
     def on_play_done(self, future):
         self.get_logger().info('Ready to record again')
@@ -267,8 +297,9 @@ class TrajectoryRetracing(Node):
         self._goal_handle.succeed()
         self._execute_future.set_result(result)
 
-    def stop_robot(self):
+    # ====================== ROBOT CONTROL ======================
 
+    def stop_robot(self):
         stop_msg = TwistStamped()
         stop_msg.header.stamp = self.get_clock().now().to_msg()
         stop_msg.header.frame_id = 'base_link'
@@ -289,11 +320,12 @@ class TrajectoryRetracing(Node):
         except Exception as e:
             self.get_logger().warn(f'Transformation failed: {e}')
             return
-        
+
         target_pose = poses[-1]
         for i in range(self.current_index, len(poses)):
-            dist = sqrt((poses[i].pose.position.x-robot_x)**2 + (poses[i].pose.position.y-robot_y)**2)
-            
+            dist = sqrt((poses[i].pose.position.x - robot_x) ** 2 +
+                        (poses[i].pose.position.y - robot_y) ** 2)
+
             if dist >= self.lookahead_distance:
                 target_pose = poses[i]
                 self.current_index = i
@@ -302,25 +334,21 @@ class TrajectoryRetracing(Node):
         try:
             transform_inv = self.tf_buffer.lookup_transform("base_link", "map", rclpy.time.Time())
             target_local = do_transform_pose_stamped(target_pose, transform_inv)
-        except Exception as e:
+        except Exception:
             return
-
 
         x_local = target_local.pose.position.x
         y_local = target_local.pose.position.y
+        L_sq = x_local ** 2 + y_local ** 2
 
-        L_sq = x_local**2 + y_local**2 
-
-        
         twist = TwistStamped()
         twist.header.stamp = self.get_clock().now().to_msg()
         twist.header.frame_id = 'base_link'
 
-        
-        dist_to_end = sqrt((poses[-1].pose.position.x - robot_x)**2 + 
-                        (poses[-1].pose.position.y - robot_y)**2)
-        
-        if dist_to_end <= 0.10: 
+        dist_to_end = sqrt((poses[-1].pose.position.x - robot_x) ** 2 +
+                           (poses[-1].pose.position.y - robot_y) ** 2)
+
+        if dist_to_end <= 0.10:
             self.robot_state = 'finis'
             self.stop_robot()
             self.finish_retracing()
@@ -337,18 +365,20 @@ class TrajectoryRetracing(Node):
         twist.twist.linear.x = v
         self.cmd_vel_pub.publish(twist)
 
-
     def following_path_callback(self):
 
         if self.robot_state != 'retracing':
             if self.robot_state == 'finis':
-             self.stop_robot()
-             self.robot_state = ''
+                self.stop_robot()
+                self.robot_state = ''
             return
+
         if self.poses is None:
             return
+
         self.following_path(self.poses)
 
+    # ====================== PATH PUBLISHING ======================
 
     def publish_smoothed_trajectory(self, poses):
         path_msg = Path_msgs()
@@ -357,38 +387,36 @@ class TrajectoryRetracing(Node):
         path_msg.poses = poses
         self.smoothed_path_publisher.publish(path_msg)
 
-
     def publish_trajectory(self, poses):
         path_msg = Path_msgs()
         path_msg.header.frame_id = "map"
         path_msg.header.stamp = Time()
-        path_msg.poses = poses 
+        path_msg.poses = poses
         self.planned_path_publisher.publish(path_msg)
 
     def republish_paths_timer(self):
         if self.poses is None:
             return
-
         self.publish_trajectory(self.poses)
         self.publish_smoothed_trajectory(self.poses)
+    # ====================== SMOOTHING SERVICE ======================
 
     def get_trajectory_smoothed(self, poses):
         request = TrajectorySmoother.Request()
         request.input_data = poses
         return self.client_get_trajectory_smoothed.call_async(request)
 
+    # ====================== ACTION SERVER ======================
 
     async def execute_callback(self, goal_handle):
-        
+
         self.get_logger().info("Action started")
 
         while not self.client_pause_recording.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for pausing the record...')
 
-        
         request_pause = Trigger.Request()
         future_pause = self.client_pause_recording.call_async(request_pause)
-        
         await future_pause
 
         if future_pause.result() is not None and future_pause.result().success:
@@ -396,37 +424,41 @@ class TrajectoryRetracing(Node):
             self.current_index = 0
             self.robot_state = ''
 
-            if goal_handle.request.map_name !="":
+            if goal_handle.request.map_name != "":
                 map_name = goal_handle.request.map_name
                 data_path = await self.trajectory_retracing(map_name)
             else:
                 data_path = await self.trajectory_retracing()
-            
+
             self.poses = self.build_poses(data_path)
+
             future_smoothed = self.get_trajectory_smoothed(self.poses)
             await future_smoothed
 
             if future_smoothed.result() is not None and future_smoothed.result().success:
-
                 self.poses = future_smoothed.result().output_data
                 self.get_logger().info('Trajectory smoothed successfully')
-
                 self.publish_smoothed_trajectory(self.poses)
-
             else:
                 self.get_logger().warn('Error while smoothing the trajectory, using raw trajectory')
-            self.first_pos_to_reach = (self.poses[0].pose.position.x, self.poses[0].pose.position.y)
-            
+
+            self.first_pos_to_reach = (
+                self.poses[0].pose.position.x,
+                self.poses[0].pose.position.y
+            )
+
             self._goal_handle = goal_handle
             self._execute_future = rclpy.task.Future()
 
             await self.go_to_first_pose()
-
+            self.get_logger().info('go_to_first_pose: Succeded')
             result = await self._execute_future
             return result
-        
+
         else:
             self.get_logger().warn("The pause wasn't accepted or received")
+
+# ========================== MAIN ==========================
 
 def main(args=None):
     rclpy.init(args=args)

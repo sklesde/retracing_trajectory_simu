@@ -225,7 +225,6 @@ class TrajectoryLogger(Node):
                 default=0)
         self.file_index +=1
         self.filename = self.log_dir / f"trajectory_logger_{self.file_index}.csv"
-        self.get_logger().info(f"Log directory: {self.log_dir}")
         self.get_logger().info(f"Log file: {self.filename}")
         self.file=open(self.filename, 'w', newline='') #Opening the file
         self.writer = csv.writer(self.file)
