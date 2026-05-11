@@ -68,12 +68,12 @@ class TrajectoryLogger(Node):
 
         self.create_subscription(
             Odometry,
-            "odom", #odom for simu #odometry/filtered for cortex
+            "odom", #odometry/filtered
             self.odom_callback,
             10
         )
 
-        self.path_publisher_logger = self.create_publisher(Path_msgs, '/path_logger', 10)
+        self.path_publisher_logger = self.create_publisher(Path_msgs, '/planned_path_logger', 10)
         self.path_msg = Path_msgs()
         self.path_msg.header.frame_id = "map"
         
@@ -208,15 +208,10 @@ class TrajectoryLogger(Node):
         self.get_logger().info('Writing history...')
 
     def new_file(self):
-
         if self.file_index is None:
             self.file_index = max(
                 (int(f.stem.split("_")[2]) for f in self.log_dir.glob("trajectory_logger_*.csv")),
                 default=0)
-        if self.total_points < 5 and hasattr(self, "file") and not self.file.closed:
-            self.get_logger().info(f'{self.map_name}')
-            self.get_logger().info(f'The file {self.filename} is empty. Writing will be on this file.')
-            return
         self.file_index +=1
         self.filename = self.log_dir / f"trajectory_logger_{self.file_index}.csv"
         self.get_logger().info(f"Log file: {self.filename}")
@@ -228,8 +223,6 @@ class TrajectoryLogger(Node):
 
         if self.last_recorded_position is not None:
             self.writer.writerow(self.last_recorded_position)
-
-        self.get_logger().info(self.map_name)
             
 
 
@@ -250,7 +243,7 @@ class TrajectoryLogger(Node):
         vx = msg.twist.twist.linear.x
         rz = msg.twist.twist.angular.z 
 
-        if self.recording_enabled and self.should_record(vx,rz):
+        if self.recording_enabled:
             self.last_odom_timestamp = timestamp
 
             self.timestamp_previous = timestamp

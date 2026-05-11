@@ -4,7 +4,7 @@ from rclpy.clock import Clock
 from rclpy.action import ActionClient, ActionServer
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 
-from std_srvs.srv import Trigger, Empty
+from std_srvs.srv import Trigger
 from nav_msgs.msg import Odometry, Path as Path_msgs
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav2_msgs.action import NavigateToPose, AssistedTeleop
@@ -33,6 +33,8 @@ class TrajectoryRetracing(Node):
         self.get_logger().info('Node started')
 
         # -------- Parameters / State --------
+        self.log_dir = Path(__file__).resolve().parent.parent.parent.parent / "src" / "trajectory_logger" / "log"
+        self.fjson_name = self.log_dir / "history.json"
         self.filename = None
 
         self.poses = None
@@ -101,17 +103,15 @@ class TrajectoryRetracing(Node):
 
         # -------- Actions --------
         self.navigate_to_pose = ActionClient(self, NavigateToPose, '/navigate_to_pose') #/cortex/navigate_to_pose
-        self.assisted_teleop_client = ActionClient(self, AssistedTeleop, '/assisted_teleop') #/cortex/assisted_teleop
+        self.assisted_teleop_client = ActionClient(self, AssistedTeleop, '/assisted_teleop')
         self.action_server = ActionServer(self, FollowTrajectory, 'follow_trajectory', self.execute_callback)
 
         # -------- Subscriptions / Timers --------
         self.create_subscription(Odometry, "odom", self.odom_callback, 10)
-        self.create_subscription(GoalStatusArray, "/navigate_to_pose/_action/status", self.goal_pose_callback, 10) #/cortex/navigate_to_pose/_action/status
+        self.create_subscription(GoalStatusArray, "/navigate_to_pose/_action/status", self.goal_pose_callback, 10)
         self.create_timer(0.1, self.following_path_callback)
         self.create_timer(1.0, self.republish_paths_timer)
 
-
-        self.stop_assisted_teleop()
 
     # ====================== DATA ======================
 
@@ -242,7 +242,6 @@ class TrajectoryRetracing(Node):
                 self.robot_state = self.STATE_RETRACING
 
     def _is_mooving(self, robot_x, robot_y):
-
         if self.last_position is None:
             return True 
                     
@@ -262,23 +261,19 @@ class TrajectoryRetracing(Node):
         self.stop_robot()
         self.stop_assisted_teleop()
         self.get_logger().info('The retracing action is stop, re-launch the action server to join back the path and continue the retracing.')
-        self.get_logger().info(f'[ABORT] _goal_handle={self._goal_handle} _execute_future={self._execute_future}')
         self.robot_state = self.STATE_IDLE
+        result = FollowTrajectory.Result()
+        result.success = False
         self.interruption_retracing = True
 
-        if hasattr(self, '_goal_handle') and self._goal_handle is not None:
-            result = FollowTrajectory.Result()
-            result.success = False
-            self._goal_handle.abort(result)
+        if hasattr(self, 'goal_handle') and self._goal_handle is not None:
+            self._goal_handle.abort()
             self._goal_handle = None
         
-
         if hasattr(self, '_execute_future') and self._execute_future is not None:
             if not self._execute_future.done():
                 self._execute_future.set_result(None)
             self._execute_future = None
-
-
 
     def timer_robot_stuck_callback(self):
         if self.robot_state == self.STATE_STUCK:
@@ -289,8 +284,7 @@ class TrajectoryRetracing(Node):
         self.stop_assisted_teleop()
         self.get_logger().error('The robot is stuck, use the Nav 2 goal tool to avoid the obstacle.')
         self._stuck_start_position = self.last_position
-        self._aboart_action()
-        # self.avoid_obstacle(self._stuck_start_position)
+        self.avoid_obstacle(self._stuck_start_position)
 
             
 
@@ -412,7 +406,6 @@ class TrajectoryRetracing(Node):
 
     def _on_teleop_sent(self, future):
         self.teleop_goal_handle = future.result()
-        self.get_logger().info(f'[TELEOP] goal_handle accepted={self.teleop_goal_handle.accepted}')
 
     def _on_goal_finished(self, future):
         self.get_logger().info("Back to track finished")
@@ -480,11 +473,11 @@ class TrajectoryRetracing(Node):
             goal.pose.pose.position.x = target_pose.pose.position.x
             goal.pose.pose.position.y = target_pose.pose.position.y
 
-            # yaw = self.compute_yaw_for_retracing()# A tenter avec l'argument self.current_index
-            # qz, qw = self.yaw_to_quaternion(yaw)
+            yaw = self.compute_yaw_for_retracing()# A tenter avec l'argument self.current_index
+            qz, qw = self.yaw_to_quaternion(yaw)
 
-            # goal.pose.pose.orientation.z = qz
-            # goal.pose.pose.orientation.w = qw
+            goal.pose.pose.orientation.z = qz
+            goal.pose.pose.orientation.w = qw
 
             future = self.navigate_to_pose.send_goal_async(goal)
             future.add_done_callback(self._on_avoid_obstacle_goal_sent)
@@ -529,11 +522,11 @@ class TrajectoryRetracing(Node):
         goal.pose.pose.position.x = x
         goal.pose.pose.position.y = y
 
-        # yaw = self.compute_yaw_for_retracing()
-        # qz, qw = self.yaw_to_quaternion(yaw)
+        yaw = self.compute_yaw_for_retracing()
+        qz, qw = self.yaw_to_quaternion(yaw)
 
-        # goal.pose.pose.orientation.z = qz
-        # goal.pose.pose.orientation.w = qw
+        goal.pose.pose.orientation.z = qz
+        goal.pose.pose.orientation.w = qw
 
 
         goal_handle = await self.navigate_to_pose.send_goal_async(goal)
@@ -548,27 +541,18 @@ class TrajectoryRetracing(Node):
         result = await goal_handle.get_result_async()
         # self.get_logger().info("go_to_first_pose: Result received!")
 
-        clear_client = self.create_client(Empty, '/local_costmap/clear_entirely_local_costmap')
-        if clear_client.wait_for_service(timeout_sec=2.0):
-            await clear_client.call_async(Empty.Request())
-            self.get_logger().info('Local costmap erased')
-        else:
-            self.get_logger().warn('Clearing local costmap impossible')
-
         teleop_goal = AssistedTeleop.Goal()
         teleop_goal.time_allowance.sec = 0
         send_future = self.assisted_teleop_client.send_goal_async(teleop_goal)
         self.teleop_goal_handle = await send_future
 
-        self.last_position = None
-
         self.robot_state = self.STATE_RETRACING
-        
+        #self.get_logger().info(f"[STATE] → {self.robot_state}")
 
     def finish_retracing(self):
         self.robot_state = self.STATE_IDLE
         self.interruption_retracing = False
-        self.get_logger().info('Retracing finish')
+        #self.get_logger().info(f"[STATE] → {self.robot_state}")
         self.stop_robot()
         self.stop_assisted_teleop()
         request_play = Trigger.Request()
@@ -604,7 +588,7 @@ class TrajectoryRetracing(Node):
         stop_msg.header.frame_id = 'base_link'
         stop_msg.twist.linear.x = 0.0
         stop_msg.twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(stop_msg)  
+        self.cmd_vel_pub.publish(stop_msg)
         self.get_logger().info("Robot stopped")
 
     def following_path(self, poses):
@@ -615,9 +599,6 @@ class TrajectoryRetracing(Node):
         if self.robot_state == self.STATE_NAV_INTERUPT:
             return
         
-        if self.robot_state == self.STATE_STUCK:
-            return
-        
         try:
             transform = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
             robot_x = transform.transform.translation.x
@@ -626,7 +607,9 @@ class TrajectoryRetracing(Node):
             self.get_logger().warn(f'Transformation failed (following path): {e}')
             return
 
-        self._is_mooving(robot_x, robot_y)  # uniquement pour alimenter le stuck timer
+        if not self._is_mooving(robot_x, robot_y):
+           return
+        
         self.last_position = (robot_x, robot_y)
 
         target_pose = poses[-1]
@@ -642,8 +625,7 @@ class TrajectoryRetracing(Node):
         try:
             transform_inv = self.tf_buffer.lookup_transform("base_link", "map", rclpy.time.Time())
             target_local = do_transform_pose_stamped(target_pose, transform_inv)
-        except Exception as e:
-            self.get_logger().warn(f'Transformation failed (following path): {e}')
+        except Exception:
             return
 
         x_local = target_local.pose.position.x
@@ -651,13 +633,14 @@ class TrajectoryRetracing(Node):
         L_sq = x_local ** 2 + y_local ** 2
 
         twist = TwistStamped()
-
         twist.header.stamp = self.get_clock().now().to_msg()
         twist.header.frame_id = 'base_link'
+
         dist_to_end = sqrt((poses[-1].pose.position.x - robot_x)**2 + (poses[-1].pose.position.y - robot_y)**2)
 
         if dist_to_end <= 0.10:
             self.robot_state = self.STATE_FINISHED
+            #self.get_logger().info(f"[STATE] → {self.robot_state}")
             self.stop_robot()
             self.finish_retracing()
             return
@@ -671,7 +654,6 @@ class TrajectoryRetracing(Node):
             twist.twist.angular.z = 0.0
 
         twist.twist.linear.x = v
-
         self.cmd_vel_pub.publish(twist)
 
     def following_path_callback(self):
@@ -685,7 +667,9 @@ class TrajectoryRetracing(Node):
 
         if self.poses is None:
             return
+
         
+
         self.following_path(self.poses)
 
 
@@ -730,20 +714,6 @@ class TrajectoryRetracing(Node):
         request_pause = Trigger.Request()
         future_pause = self.client_pause_recording.call_async(request_pause)
         await future_pause
-
-        future_log_dir = self.client_get_log_dir.call_async(Trigger.Request())
-        await future_log_dir
-
-        if future_log_dir.result() is not None and future_log_dir.result().success:
-            self.log_dir = Path(future_log_dir.result().message)
-            self.fjson_name = self.log_dir / "history.json"
-            self.get_logger().info(f"Log dir: {self.log_dir}")
-        else:
-            self.get_logger().error("Cannot get log dir")
-            goal_handle.abort()
-            result = FollowTrajectory.Result()
-            result.success = False
-            return result
 
         if self.interruption_retracing:
             self.get_logger().info('Resume retracing from closest point on the path')
@@ -800,7 +770,6 @@ class TrajectoryRetracing(Node):
 
             await self.go_to_first_pose()
             self.get_logger().info('go_to_first_pose: Succeded')
-            self.get_logger().info('Retracing the trajectory')
 
             result = await self._execute_future
 

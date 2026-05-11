@@ -5,7 +5,7 @@ from trajectory_tools_interfaces.srv import TrajectorySmoother
 import numpy as np
 from nav_msgs.msg import Path as Path_msgs
 from geometry_msgs.msg import PoseStamped
-from ccma import CCMA
+
 
 
 class TrajectorySmootherNode(Node):
@@ -13,14 +13,16 @@ class TrajectorySmootherNode(Node):
         super().__init__('trajectory_smoother')
         self.get_logger().info('Node started')
 
-        self.w_ma = 5 #Moving average parameter
-        self.w_cc = 3 #Curvature Corrected parameter
+        self.alpha = 0.5
+        self.N = 150
+        self.lambda_smoother = 0.60
     
         self.get_trajectory_smoothed = self.create_service(
                                 TrajectorySmoother,
                                 '/get_trajectory_smoothed',
                                 self.get_trajectory_smoothed_callback
                                 )
+        
 
     
 
@@ -32,9 +34,8 @@ class TrajectorySmootherNode(Node):
 
         try:
             np_input_data = np.array([[p.pose.position.x, p.pose.position.y] for p in request.input_data])
-
-            modified_data = self.modify_trajectory(np_input_data)
-            output_data = self.convert_np_to_list(modified_data, request.input_data)
+            ls_data = self.laplacian_smoothing(np_input_data, self.N, self.lambda_smoother)
+            output_data = self.convert_np_to_list(ls_data, request.input_data)
             
             response.output_data = output_data
             response.success = True
@@ -52,13 +53,17 @@ class TrajectorySmootherNode(Node):
         # self.get_logger().info('Affichage du chemin')
         
         return response
-    
-    def modify_trajectory(self, input_data):  
-        trajectory_data_2D = input_data[:,:2]
-        ccma = CCMA(w_ma=self.w_ma, w_cc = self.w_cc)
-        smoothed_points = ccma.filter(trajectory_data_2D)
-        return smoothed_points
-    
+
+    def laplacian_smoothing(self, np_input_data, N, lambda_smoother):
+        ls_data = np.copy(np_input_data)
+
+        for i in range(N):
+        
+            for pose in range(1,len(ls_data)-1):
+                ls_data[pose] = ls_data[pose] + lambda_smoother*((ls_data[pose-1]+ls_data[pose+1])/2-ls_data[pose])
+
+        return ls_data
+
     def convert_np_to_list(self, smoothed_path, input_data):
 
         output_data = []

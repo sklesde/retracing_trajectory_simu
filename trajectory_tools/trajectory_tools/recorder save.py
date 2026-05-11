@@ -48,33 +48,28 @@ class TrajectoryRecorder(Node):
             '/play_recording',
             self.play_recording_callback
         )
-        self.start_client.wait_for_service()
-        self.stop_client.wait_for_service()
 
     def activate_callback(self, request, response):
         self.start_record = True
         self.get_logger().info('Trajectory recorder activated!')
-        self.start_record_callback() 
         response.success = True
         return response
 
     def pause_recording_callback(self, request, response):
         self.start_record = False
-        self.stop_record_callback()
+        if self.current_goal_id is not None:
+            self.stop_record_callback()
         response.success = True
         return response
 
     def play_recording_callback(self, request, response):
         self.start_record = True
-        self.start_record_callback()
+        if self.current_goal_id is not None:
+            self.start_record_callback()
         response.success = True
         return response
 
     def start_record_callback(self):
-        if not self.start_client.service_is_ready():
-            self.get_logger().warn("start_recording not ready")
-            return
-        
         if self.transitioning:
             return
 
@@ -85,7 +80,7 @@ class TrajectoryRecorder(Node):
 
         future = self.start_client.call_async(Trigger.Request())
         future.add_done_callback(self.on_start_response)
-        self.get_logger().info("_______________")
+
         self.get_logger().info("Recording request sent")
 
     def on_start_response(self, future):
@@ -174,4 +169,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
